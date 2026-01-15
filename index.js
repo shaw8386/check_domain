@@ -16,12 +16,14 @@ const { Pool } = pkg;
  * - DEFAULT_MAXTIME_TRY_SECONDS: fallback nếu sheet thiếu Maxtime_try
  * - REQUEST_TIMEOUT_MS: timeout mỗi request (mặc định 15000ms)
  * - MAX_REDIRECT_FIX: giới hạn số lần tự "fix redirect"
- * - CRON_SCHEDULE: cron schedule (default: "0 */3 * * *" = every 3 hours)
+ * - CRON_SCHEDULE: cron schedule (default: "0 *\/3 * * *" = every 3 hours)
  */
 
 const GS_API_URL = process.env.GS_API_URL;
 const GS_TOKEN = process.env.GS_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
+const GS_INPUT_SPREADSHEET_ID = process.env.GS_INPUT_SPREADSHEET_ID;
+const GS_OUTPUT_SPREADSHEET_ID = process.env.GS_OUTPUT_SPREADSHEET_ID;
 
 const DEFAULT_MAX_SLOTS = parseInt(process.env.DEFAULT_MAX_SLOTS || "3", 10);
 const DEFAULT_MAXTIME_TRY_SECONDS = parseInt(process.env.DEFAULT_MAXTIME_TRY_SECONDS || "10", 10);
@@ -37,6 +39,15 @@ if (!GS_API_URL || !GS_TOKEN) {
 if (!DATABASE_URL) {
   console.error("Missing DATABASE_URL env");
   process.exit(1);
+}
+
+// Spreadsheet IDs are optional if set in Apps Script properties, but recommended to set here
+if (!GS_INPUT_SPREADSHEET_ID) {
+  console.warn("Warning: GS_INPUT_SPREADSHEET_ID not set. Will rely on Apps Script properties.");
+}
+
+if (!GS_OUTPUT_SPREADSHEET_ID) {
+  console.warn("Warning: GS_OUTPUT_SPREADSHEET_ID not set. Will rely on Apps Script properties.");
 }
 
 // Initialize Postgres connection pool
@@ -238,11 +249,17 @@ async function checkOnce({ url, proxyUrl, headers }) {
 
 /**
  * Read input from Apps Script:
- * GET {GS_API_URL}?action=input&token=...
+ * GET {GS_API_URL}?action=input&token=...&inputSpreadsheetId=...
  * Expect: { ok:true, rows:[{Domain,...}] }
  */
 async function getInputRows() {
-  const url = `${GS_API_URL}?action=input&token=${encodeURIComponent(GS_TOKEN)}`;
+  let url = `${GS_API_URL}?action=input&token=${encodeURIComponent(GS_TOKEN)}`;
+  
+  // Add input spreadsheet ID if provided
+  if (GS_INPUT_SPREADSHEET_ID) {
+    url += `&inputSpreadsheetId=${encodeURIComponent(GS_INPUT_SPREADSHEET_ID)}`;
+  }
+  
   const res = await axios.get(url, { timeout: 20000 });
   if (!res.data?.ok) throw new Error(res.data?.error || "GS input error");
   return res.data.rows || [];
@@ -300,7 +317,7 @@ async function saveToDatabase(result) {
 
 /**
  * Write output to Apps Script:
- * POST {action:"output", token, sheetName, headers, data}
+ * POST {action:"output", token, outputSpreadsheetId, sheetName, headers, data}
  */
 async function postOutput(sheetName, data) {
   const payload = {
@@ -324,6 +341,11 @@ async function postOutput(sheetName, data) {
       StatusFinal: row.StatusFinal || "FAIL"
     }))
   };
+
+  // Add output spreadsheet ID if provided
+  if (GS_OUTPUT_SPREADSHEET_ID) {
+    payload.outputSpreadsheetId = GS_OUTPUT_SPREADSHEET_ID;
+  }
 
   const res = await axios.post(GS_API_URL, payload, { timeout: 30000 });
   if (!res.data?.ok) throw new Error(res.data?.error || "GS output error");
