@@ -16,7 +16,8 @@ const { Pool } = pkg;
  * - DEFAULT_MAXTIME_TRY_SECONDS: fallback nếu sheet thiếu Maxtime_try
  * - REQUEST_TIMEOUT_MS: timeout mỗi request (mặc định 15000ms)
  * - MAX_REDIRECT_FIX: giới hạn số lần tự "fix redirect"
- * - CRON_SCHEDULE: cron schedule (default: "0 *\/3 * * *" = every 3 hours)
+ * - CRON_SCHEDULE: cron schedule in server timezone (default: "0 *\/3 * * *" = every 3 hours)
+ *   Note: All logs and output use Vietnam time (Asia/Ho_Chi_Minh). Adjust CRON_SCHEDULE based on server timezone.
  */
 
 const GS_API_URL = process.env.GS_API_URL;
@@ -42,6 +43,7 @@ if (!DATABASE_URL) {
 }
 
 // Spreadsheet IDs are optional if set in Apps Script properties, but recommended to set here
+// Note: These warnings appear before timezone functions are defined, so they use server time
 if (!GS_INPUT_SPREADSHEET_ID) {
   console.warn("Warning: GS_INPUT_SPREADSHEET_ID not set. Will rely on Apps Script properties.");
 }
@@ -55,6 +57,70 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
 });
+
+const VIETNAM_TIMEZONE = "Asia/Ho_Chi_Minh";
+
+/**
+ * Get date/time parts in Vietnam timezone
+ */
+function getVietnamDateParts(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: VIETNAM_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+  
+  const parts = formatter.formatToParts(date).reduce((acc, part) => {
+    acc[part.type] = part.value;
+    return acc;
+  }, {});
+  
+  return {
+    year: parts.year,
+    month: parts.month,
+    day: parts.day,
+    hour: parts.hour,
+    minute: parts.minute,
+    second: parts.second
+  };
+}
+
+/**
+ * Get current date/time as Date object representing Vietnam time
+ * Note: This creates a Date object that represents the same moment in Vietnam time
+ */
+function getVietnamDate(date = new Date()) {
+  const parts = getVietnamDateParts(date);
+  // Create a date string in ISO format and parse it
+  // Vietnam is UTC+7, so we create a UTC date that represents the Vietnam time
+  const vnDateString = `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
+  // Parse as if it's UTC+7, then convert to actual Date
+  const utcDate = new Date(vnDateString + "+07:00");
+  return utcDate;
+}
+
+/**
+ * Format date to ISO string in Vietnam timezone
+ * Returns: YYYY-MM-DDTHH:mm:ss+07:00 format
+ */
+function getVietnamISOString(date = new Date()) {
+  const parts = getVietnamDateParts(date);
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}+07:00`;
+}
+
+/**
+ * Format date for logging in Vietnam timezone
+ * Returns: YYYY-MM-DD HH:mm:ss (VN)
+ */
+function getVietnamLogTime(date = new Date()) {
+  const parts = getVietnamDateParts(date);
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} (VN)`;
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -285,9 +351,9 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_domain_checks_domain ON domain_checks(domain);
       CREATE INDEX IF NOT EXISTS idx_domain_checks_update_time ON domain_checks(update_time);
     `);
-    console.log("Database schema initialized");
+    console.log(`[${getVietnamLogTime()}] Database schema initialized`);
   } catch (error) {
-    console.error("Error initializing database:", error);
+    console.error(`[${getVietnamLogTime()}] Error initializing database:`, error);
     throw error;
   }
 }
@@ -297,6 +363,8 @@ async function initDatabase() {
  */
 async function saveToDatabase(result) {
   try {
+    // Use Vietnam time for database timestamp
+    const vnDate = getVietnamDate();
     await pool.query(
       `INSERT INTO domain_checks (domain, isp, dns, update_time, status_http, status_final)
        VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -304,13 +372,13 @@ async function saveToDatabase(result) {
         result.Domain || "",
         result.ISP || "",
         result.DNS || "",
-        new Date(),
+        vnDate,
         result.StatusHTTP ? String(result.StatusHTTP) : "",
         result.StatusFinal || "FAIL"
       ]
     );
   } catch (error) {
-    console.error(`Error saving to database for domain ${result.Domain}:`, error);
+    console.error(`[${getVietnamLogTime()}] Error saving to database for domain ${result.Domain}:`, error);
     // Don't throw - continue processing other rows
   }
 }
@@ -336,7 +404,7 @@ async function postOutput(sheetName, data) {
       Domain: row.Domain || "",
       ISP: row.ISP || "",
       DNS: row.DNS || "",
-      Update: new Date().toISOString(),
+      Update: getVietnamISOString(),
       StatusHTTP: row.StatusHTTP ? String(row.StatusHTTP) : "",
       StatusFinal: row.StatusFinal || "FAIL"
     }))
@@ -357,7 +425,7 @@ async function postOutput(sheetName, data) {
  */
 function vnSheetName(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Ho_Chi_Minh",
+    timeZone: VIETNAM_TIMEZONE,
     hour12: false,
     year: "numeric",
     month: "2-digit",
@@ -497,7 +565,7 @@ async function processRow(row) {
       }
 
       // ghi log ra console để Railway log
-      console.error(`[FAIL] domain=${domain} slot=${slot}/${maxSlots} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"} err=${msg}`);
+      console.error(`[${getVietnamLogTime()}] [FAIL] domain=${domain} slot=${slot}/${maxSlots} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"} err=${msg}`);
     }
   }
 
@@ -516,16 +584,16 @@ async function processRow(row) {
 }
 
 async function main() {
-  console.log(`[${new Date().toISOString()}] Starting domain check process...`);
+  console.log(`[${getVietnamLogTime()}] Starting domain check process...`);
   
   try {
     const rows = await getInputRows();
-    console.log(`Retrieved ${rows.length} rows from Google Sheets`);
+    console.log(`[${getVietnamLogTime()}] Retrieved ${rows.length} rows from Google Sheets`);
 
     const output = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
-      console.log(`Processing row ${i + 1}/${rows.length}: ${row.Domain || "N/A"}`);
+      console.log(`[${getVietnamLogTime()}] Processing row ${i + 1}/${rows.length}: ${row.Domain || "N/A"}`);
       
       const r = await processRow(row);
       output.push(r);
@@ -534,12 +602,12 @@ async function main() {
       await saveToDatabase(r);
     }
 
-    const sheetName = vnSheetName(new Date());
+    const sheetName = vnSheetName(getVietnamDate());
     await postOutput(sheetName, output);
 
-    console.log(`[${new Date().toISOString()}] DONE outputSheet=${sheetName} rows=${output.length}`);
+    console.log(`[${getVietnamLogTime()}] DONE outputSheet=${sheetName} rows=${output.length}`);
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Error in main process:`, error);
+    console.error(`[${getVietnamLogTime()}] Error in main process:`, error);
     throw error;
   }
 }
@@ -548,38 +616,43 @@ async function main() {
 async function start() {
   try {
     await initDatabase();
-    console.log("Database initialized successfully");
+    console.log(`[${getVietnamLogTime()}] Database initialized successfully`);
     
     // Run immediately on startup (optional - remove if you only want scheduled runs)
-    // await main();
+    await main();
     
-    // Schedule job to run every 3 hours
-    console.log(`Scheduling job with cron: ${CRON_SCHEDULE}`);
+    // Schedule job to run every 3 hours (in server timezone, but logs will show Vietnam time)
+    // Note: Cron runs in server timezone. To run at specific Vietnam times, adjust CRON_SCHEDULE
+    // Example: "0 0,3,6,9,12,15,18,21 * * *" runs at 00:00, 03:00, 06:00, etc. in server timezone
+    // If server is UTC, add 7 hours to get Vietnam time (e.g., "0 7,10,13,16,19,22,1,4 * * *" for Vietnam 00:00, 03:00, etc.)
+    console.log(`[${getVietnamLogTime()}] Scheduling job with cron: ${CRON_SCHEDULE} (server timezone)`);
+    console.log(`[${getVietnamLogTime()}] Current Vietnam time: ${getVietnamLogTime()}`);
+    
     cron.schedule(CRON_SCHEDULE, async () => {
-      console.log(`[${new Date().toISOString()}] Scheduled job triggered`);
+      console.log(`[${getVietnamLogTime()}] Scheduled job triggered`);
       try {
         await main();
       } catch (error) {
-        console.error(`[${new Date().toISOString()}] Scheduled job error:`, error);
+        console.error(`[${getVietnamLogTime()}] Scheduled job error:`, error);
       }
     });
     
-    console.log("Scheduler started. Waiting for next scheduled run...");
+    console.log(`[${getVietnamLogTime()}] Scheduler started. Waiting for next scheduled run...`);
     
     // Keep process alive
     process.on("SIGTERM", async () => {
-      console.log("SIGTERM received, closing database pool...");
+      console.log(`[${getVietnamLogTime()}] SIGTERM received, closing database pool...`);
       await pool.end();
       process.exit(0);
     });
     
     process.on("SIGINT", async () => {
-      console.log("SIGINT received, closing database pool...");
+      console.log(`[${getVietnamLogTime()}] SIGINT received, closing database pool...`);
       await pool.end();
       process.exit(0);
     });
   } catch (error) {
-    console.error("Error starting application:", error);
+    console.error(`[${getVietnamLogTime()}] Error starting application:`, error);
     process.exit(1);
   }
 }
