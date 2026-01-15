@@ -320,15 +320,33 @@ async function checkOnce({ url, proxyUrl, headers }) {
  */
 async function getInputRows() {
   let url = `${GS_API_URL}?action=input&token=${encodeURIComponent(GS_TOKEN)}`;
-  
-  // Add input spreadsheet ID if provided
+
   if (GS_INPUT_SPREADSHEET_ID) {
     url += `&inputSpreadsheetId=${encodeURIComponent(GS_INPUT_SPREADSHEET_ID)}`;
   }
-  
-  const res = await axios.get(url, { timeout: 20000 });
-  if (!res.data?.ok) throw new Error(res.data?.error || "GS input error");
-  return res.data.rows || [];
+
+  console.log(`[${getVietnamLogTime()}] GS GET: ${url.replace(GS_TOKEN, "***")}`);
+
+  try {
+    const res = await axios.get(url, {
+      timeout: 20000,
+      // tránh cache + dễ debug
+      headers: { "Cache-Control": "no-cache" }
+    });
+
+    console.log(`[${getVietnamLogTime()}] GS status=${res.status} data=${JSON.stringify(res.data)}`);
+
+    if (!res.data || res.data.ok !== true) {
+      throw new Error(`GS input error: ${res.data?.error || "empty/invalid response"}`);
+    }
+    return res.data.rows || [];
+  } catch (err) {
+    // axios error details
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    console.error(`[${getVietnamLogTime()}] GS request failed status=${status} data=${JSON.stringify(data)} err=${err?.message}`);
+    throw err;
+  }
 }
 
 /**
