@@ -10,6 +10,8 @@
     "axios": "^1.7.9",
     "https-proxy-agent": "^7.0.6",
     "pg": "^8.11.3",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "cheerio": "^1.0.0-rc.12",
+    "node-cron-timezone": "^1.2.0"
   }
 }
