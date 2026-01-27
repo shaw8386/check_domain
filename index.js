@@ -1,677 +1,695 @@
-import axios from "axios";
-import { HttpsProxyAgent } from "https-proxy-agent";
-import pkg from "pg";
-import cron from "node-cron";
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import pkg from 'pg';
+import axios from 'axios';
+import * as cheerio from 'cheerio';
 
 const { Pool } = pkg;
 
-/**
- * ENV cần có:
- * - GS_API_URL: URL Web App Apps Script (doGet/doPost)
- * - GS_TOKEN: token secret để auth
- * - DATABASE_URL: Postgres connection string (Railway provides this)
- *
- * Tuỳ chọn:
- * - DEFAULT_MAX_SLOTS: fallback nếu sheet thiếu Max_Slot_try
- * - DEFAULT_MAXTIME_TRY_SECONDS: fallback nếu sheet thiếu Maxtime_try
- * - REQUEST_TIMEOUT_MS: timeout mỗi request (mặc định 15000ms)
- * - MAX_REDIRECT_FIX: giới hạn số lần tự "fix redirect"
- * - CRON_SCHEDULE: cron schedule in server timezone (default: "0 *\/3 * * *" = every 3 hours)
- *   Note: All logs and output use Vietnam time (Asia/Ho_Chi_Minh). Adjust CRON_SCHEDULE based on server timezone.
- */
+dotenv.config();
 
-const GS_API_URL = process.env.GS_API_URL;
-const GS_TOKEN = process.env.GS_TOKEN;
-const DATABASE_URL = process.env.DATABASE_URL;
-const GS_INPUT_SPREADSHEET_ID = process.env.GS_INPUT_SPREADSHEET_ID;
-const GS_OUTPUT_SPREADSHEET_ID = process.env.GS_OUTPUT_SPREADSHEET_ID;
-const DEFAULT_MAX_SLOTS = parseInt(process.env.DEFAULT_MAX_SLOTS || "3", 10);
-const DEFAULT_MAXTIME_TRY_SECONDS = parseInt(process.env.DEFAULT_MAXTIME_TRY_SECONDS || "10", 10);
-const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "5000", 10);
-const MAX_REDIRECT_FIX = parseInt(process.env.MAX_REDIRECT_FIX || "3", 10);
-const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 */3 * * *"; // Every 3 hours
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-if (!GS_API_URL || !GS_TOKEN) {
-  console.error("Missing GS_API_URL or GS_TOKEN env");
-  process.exit(1);
-}
-
-if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL env");
-  process.exit(1);
-}
-
-// Spreadsheet IDs are optional if set in Apps Script properties, but recommended to set here
-// Note: These warnings appear before timezone functions are defined, so they use server time
-if (!GS_INPUT_SPREADSHEET_ID) {
-  console.warn("Warning: GS_INPUT_SPREADSHEET_ID not set. Will rely on Apps Script properties.");
-}
-
-if (!GS_OUTPUT_SPREADSHEET_ID) {
-  console.warn("Warning: GS_OUTPUT_SPREADSHEET_ID not set. Will rely on Apps Script properties.");
-}
-
-// Initialize Postgres connection pool
+// Railway thường dùng DATABASE_URL (postgres://user:pass@host:port/db)
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : false
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false }
 });
 
-const VIETNAM_TIMEZONE = "Asia/Ho_Chi_Minh";
+// ====== INIT DB (DDL) ======
 
-/**
- * Get date/time parts in Vietnam timezone
- */
-function getVietnamDateParts(date = new Date()) {
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: VIETNAM_TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false
-  });
-  
-  const parts = formatter.formatToParts(date).reduce((acc, part) => {
-    acc[part.type] = part.value;
-    return acc;
-  }, {});
-  
-  return {
-    year: parts.year,
-    month: parts.month,
-    day: parts.day,
-    hour: parts.hour,
-    minute: parts.minute,
-    second: parts.second
-  };
+async function initDb() {
+  // regions
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS regions (
+      id SERIAL PRIMARY KEY,
+      code VARCHAR(10) UNIQUE NOT NULL,
+      name VARCHAR(100) NOT NULL
+    );
+  `);
+
+  // lottery_provinces
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lottery_provinces (
+      id SERIAL PRIMARY KEY,
+      region_id INTEGER NOT NULL REFERENCES regions(id) ON DELETE RESTRICT,
+      code VARCHAR(10) UNIQUE NOT NULL,
+      name VARCHAR(100) NOT NULL
+    );
+  `);
+
+  // lottery_draws
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lottery_draws (
+      id SERIAL PRIMARY KEY,
+      draw_date DATE NOT NULL,
+      province_id INTEGER NOT NULL REFERENCES lottery_provinces(id) ON DELETE RESTRICT,
+      region_id INTEGER NOT NULL REFERENCES regions(id) ON DELETE RESTRICT,
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      UNIQUE (draw_date, province_id)
+    );
+  `);
+
+  // lottery_results
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lottery_results (
+      id SERIAL PRIMARY KEY,
+      draw_id INTEGER NOT NULL REFERENCES lottery_draws(id) ON DELETE CASCADE,
+      prize_code VARCHAR(20) NOT NULL,
+      prize_order INTEGER NOT NULL,
+      result_number TEXT NOT NULL
+    );
+  `);
+
+  // auth_accept
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS auth_accept (
+      id SERIAL PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      api_key TEXT NOT NULL UNIQUE,
+      ip_address TEXT,
+      user_agent TEXT,
+      scopes TEXT, -- JSON string (e.g. '["read","write"]')
+      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+      last_used_at TIMESTAMP,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE
+    );
+  `);
+
+  await seedRegionsAndProvinces();
 }
 
-/**
- * Get current date/time as Date object representing Vietnam time
- * Note: This creates a Date object that represents the same moment in Vietnam time
- */
-function getVietnamDate(date = new Date()) {
-  const parts = getVietnamDateParts(date);
-  // Create a date string in ISO format and parse it
-  // Vietnam is UTC+7, so we create a UTC date that represents the Vietnam time
-  const vnDateString = `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
-  // Parse as if it's UTC+7, then convert to actual Date
-  const utcDate = new Date(vnDateString + "+07:00");
-  return utcDate;
+// ====== CRAWL MINH NGỌC - HELPERS ======
+
+// Tạo danh sách ngày gần nhất, n ngày
+function getLastNDaysDates(n = 100) {
+  const dates = [];
+  const today = new Date();
+
+  for (let i = 0; i < n; i++) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const yyyy = d.getFullYear();
+
+    dates.push({
+      display: `${dd}-${mm}-${yyyy}`, // dùng cho URL Minh Ngọc
+      iso: `${yyyy}-${mm}-${dd}` // dùng để lưu DB (DATE)
+    });
+  }
+
+  return dates;
 }
 
-/**
- * Format date to ISO string in Vietnam timezone
- * Returns: YYYY-MM-DDTHH:mm:ss+07:00 format
- */
-function getVietnamISOString(date = new Date()) {
-  const parts = getVietnamDateParts(date);
-  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}+07:00`;
-}
+const REGION_SLUGS = {
+  MB: 'mien-bac',
+  MT: 'mien-trung',
+  MN: 'mien-nam'
+};
 
-/**
- * Format date for logging in Vietnam timezone
- * Returns: YYYY-MM-DD HH:mm:ss (VN)
- */
-function getVietnamLogTime(date = new Date()) {
-  const parts = getVietnamDateParts(date);
-  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} (VN)`;
-}
+// Map tên tỉnh trên Minh Ngọc -> code tỉnh trong DB
+const MINH_NGOC_PROVINCE_NAME_MAP = {
+  // Miền Nam
+  'TP.HCM': 'HCM',
+  'TP Hồ Chí Minh': 'HCM',
+  'TP Ho Chi Minh': 'HCM',
+  'An Giang': 'AG',
+  'Bạc Liêu': 'BL',
+  'Bình Dương': 'BDI',
+  'Bình Phước': 'BP',
+  'Bình Thuận': 'BTH',
+  'Bà Rịa Vũng Tàu': 'BRVT',
+  'Bà Rịa - Vũng Tàu': 'BRVT',
+  'Bến Tre': 'BTR',
+  'Cà Mau': 'CM',
+  'Cần Thơ': 'CT',
+  'Đà Lạt': 'DL',
+  'Đồng Nai': 'DNM',
+  'Đồng Tháp': 'DT',
+  'Hậu Giang': 'HG',
+  'Kiên Giang': 'KG',
+  'Long An': 'LA',
+  'Sóc Trăng': 'ST',
+  'Tây Ninh': 'TN',
+  'Tiền Giang': 'TG',
+  'Trà Vinh': 'TV',
+  'Vĩnh Long': 'VL',
+  // Miền Trung
+  'Đà Nẵng': 'DN',
+  'Quảng Bình': 'QB',
+  'Quảng Trị': 'QT',
+  'Thừa Thiên Huế': 'TTH',
+  'Khánh Hòa': 'KH',
+  'Bình Định': 'BD',
+  'Ninh Thuận': 'NT',
+  'Phú Yên': 'BPY',
+  'Gia Lai': 'GL',
+  'Đắk Lắk': 'DK',
+  'Đắk Nông': 'DNO',
+  'Quảng Nam': 'QNA',
+  'Quảng Ngãi': 'QTN',
+  // Miền Bắc
+  'Hà Nội': 'HN',
+  'Hải Phòng': 'HP',
+  'Quảng Ninh': 'QN',
+  'Thái Bình': 'TB',
+  'Bắc Ninh': 'BN',
+  'Nam Định': 'ND',
+  'Phú Thọ': 'PT',
+  'Thanh Hóa': 'TH',
+  'Nghệ An': 'NA',
+  'Bắc Giang': 'BDH',
+  'Hà Nam': 'HNA',
+  'Hưng Yên': 'HDU'
+};
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-/**
- * Parse proxy string from sheet column `Proxy_IP_PORT_USER_PASS`.
- *
- * Hỗ trợ các format phổ biến:
- * 1) ip:port:user:pass
- * 2) user:pass@ip:port
- * 3) http://user:pass@ip:port
- * 4) https://user:pass@ip:port
- *
- * Return: proxyUrl (string) hoặc null
- */
-function parseProxy(proxyRaw) {
-  if (!proxyRaw) return null;
-  const s = String(proxyRaw).trim();
-  if (!s) return null;
-
-  // already a url
-  if (s.startsWith("http://") || s.startsWith("https://")) return s;
-
-  // user:pass@ip:port
-  if (s.includes("@") && s.includes(":")) {
-    return "http://" + s; // default http proxy scheme
-  }
-
-  // ip:port:user:pass  (4 parts)
-  const parts = s.split(":");
-  if (parts.length === 4) {
-    const [ip, port, user, pass] = parts;
-    return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${ip}:${port}`;
-  }
-
-  // ip:port (no auth)
-  if (parts.length === 2) {
-    const [ip, port] = parts;
-    return `http://${ip}:${port}`;
-  }
-
-  // fallback: treat as host:port or raw
-  return "http://" + s;
-}
-
-function normalizeDomain(domainRaw) {
-  const d = String(domainRaw || "").trim();
-  if (!d) return "";
-  // nếu người dùng nhập full url, tách host
-  try {
-    if (d.startsWith("http://") || d.startsWith("https://")) {
-      const u = new URL(d);
-      return u.host;
-    }
-  } catch {}
-  return d;
-}
-
-/**
- * Generate target URLs to try.
- * Ưu tiên HTTPS trước, rồi HTTP; thử thêm/bớt www nếu cần.
- */
-function buildCandidateUrls(domain) {
-  const host = normalizeDomain(domain);
-  if (!host) return [];
-
-  const hasWww = host.startsWith("www.");
-  const bare = hasWww ? host.slice(4) : host;
-  const withWww = hasWww ? host : `www.${host}`;
-
-  // ưu tiên dạng host gốc trước, sau đó biến thể
-  const hosts = [host];
-  if (host !== bare) hosts.push(bare);
-  if (host !== withWww) hosts.push(withWww);
-
-  const urls = [];
-  for (const h of hosts) {
-    urls.push(`https://${h}`);
-    urls.push(`http://${h}`);
-  }
-
-  // loại trùng
-  return [...new Set(urls)];
-}
-
-/**
- * “Xử lí lỗi theo status”:
- * - Tuỳ theo status/failure type, điều chỉnh headers, url list, delay...
- */
-function getFixPlan({ status, errorCode, currentUrl, domain, redirectLocation }) {
-  const plan = {
-    extraDelayMs: 0,
-    headers: null,
-    nextUrls: []
-  };
-
-  // Base “browser-like” headers (đặc biệt hữu ích với 403/406)
-  const browserHeaders = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept":
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
-  };
-
-  // Nếu lỗi timeout / network
-  if (errorCode === "ETIMEDOUT" || errorCode === "ECONNABORTED") {
-    plan.extraDelayMs = 2000;
-    plan.headers = browserHeaders;
-    plan.nextUrls = [currentUrl]; // try same
-    return plan;
-  }
-
-  // 429: rate limit -> chờ lâu hơn
-  if (status === 429) {
-    plan.extraDelayMs = 10000;
-    plan.headers = browserHeaders;
-    plan.nextUrls = [currentUrl];
-    return plan;
-  }
-
-  // 403/406: thử “browser-like” headers
-  if (status === 403 || status === 406) {
-    plan.extraDelayMs = 3000;
-    plan.headers = browserHeaders;
-    plan.nextUrls = [currentUrl];
-    return plan;
-  }
-
-  // 404: thử biến thể www và http/https
-  if (status === 404) {
-    plan.headers = browserHeaders;
-    plan.nextUrls = buildCandidateUrls(domain);
-    return plan;
-  }
-
-  // 3xx: vì bạn muốn 3xx là FAIL, nhưng “xử lí” bằng cách thử Location
-  if (status >= 300 && status <= 399 && redirectLocation) {
-    // if Location là relative, resolve
-    try {
-      const resolved = new URL(redirectLocation, currentUrl).toString();
-      plan.nextUrls = [resolved];
-    } catch {
-      plan.nextUrls = [currentUrl];
-    }
-    plan.headers = browserHeaders;
-    return plan;
-  }
-
-  // 5xx: lỗi server -> backoff nhẹ, thử lại
-  if (status >= 500 && status <= 599) {
-    plan.extraDelayMs = 4000;
-    plan.headers = browserHeaders;
-    plan.nextUrls = [currentUrl];
-    return plan;
-  }
-
-  // Default: retry same with browser headers
-  plan.headers = browserHeaders;
-  plan.nextUrls = [currentUrl];
-  return plan;
-}
-
-/**
- * Single HTTP check attempt.
- * SUCCESS only if status === 200
- * For redirect handling: we keep maxRedirects=0 để bắt 3xx và xử lí theo Location.
- */
-async function checkOnce({ url, proxyUrl, headers }) {
-  const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
+async function fetchMinhNgocHtml(regionSlug, dateDisplay) {
+  const url = `https://www.minhngoc.net.vn/ket-qua-xo-so/${regionSlug}/${dateDisplay}.html`;
+  console.log('Fetching:', url);
 
   const res = await axios.get(url, {
-    timeout: REQUEST_TIMEOUT_MS,
-    validateStatus: () => true,
-    maxRedirects: 0, // quan trọng: bắt 3xx, tự xử lí “fix”
-    headers: headers || {
-      "User-Agent": "Railway-Proxy-HTTP-Checker/1.0",
-      "Accept": "*/*"
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
     },
-    httpsAgent: agent,
-    httpAgent: agent
+    timeout: 15000
   });
 
-  return {
-    status: res.status,
-    redirectLocation: res.headers?.location || null
-  };
-}
-
-/**
- * Read input from Apps Script:
- * GET {GS_API_URL}?action=input&token=...&inputSpreadsheetId=...
- * Expect: { ok:true, rows:[{Domain,...}] }
- */
-async function getInputRows() {
-  let url = `${GS_API_URL}?action=input&token=${encodeURIComponent(GS_TOKEN)}`;
-
-  if (GS_INPUT_SPREADSHEET_ID) {
-    url += `&inputSpreadsheetId=${encodeURIComponent(GS_INPUT_SPREADSHEET_ID)}`;
-  }
-
-  console.log(`[${getVietnamLogTime()}] GS GET: ${url.replace(GS_TOKEN, "***")}`);
-
-  try {
-    const res = await axios.get(url, {
-      timeout: 20000,
-      // tránh cache + dễ debug
-      headers: { "Cache-Control": "no-cache" }
-    });
-
-    console.log(`[${getVietnamLogTime()}] GS status=${res.status} data=${JSON.stringify(res.data)}`);
-
-    if (!res.data || res.data.ok !== true) {
-      throw new Error(`GS input error: ${res.data?.error || "empty/invalid response"}`);
-    }
-    return res.data.rows || [];
-  } catch (err) {
-    // axios error details
-    const status = err?.response?.status;
-    const data = err?.response?.data;
-    console.error(`[${getVietnamLogTime()}] GS request failed status=${status} data=${JSON.stringify(data)} err=${err?.message}`);
-    throw err;
-  }
-}
-
-/**
- * Initialize database schema
- */
-async function initDatabase() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS domain_checks (
-        id SERIAL PRIMARY KEY,
-        domain VARCHAR(255) NOT NULL,
-        isp VARCHAR(255),
-        dns VARCHAR(255),
-        update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        status_http VARCHAR(10),
-        status_final VARCHAR(10) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-      
-      CREATE INDEX IF NOT EXISTS idx_domain_checks_domain ON domain_checks(domain);
-      CREATE INDEX IF NOT EXISTS idx_domain_checks_update_time ON domain_checks(update_time);
-    `);
-    console.log(`[${getVietnamLogTime()}] Database schema initialized`);
-  } catch (error) {
-    console.error(`[${getVietnamLogTime()}] Error initializing database:`, error);
-    throw error;
-  }
-}
-
-/**
- * Save result to Postgres database
- */
-async function saveToDatabase(result) {
-  try {
-    // Use Vietnam time for database timestamp
-    const vnDate = getVietnamDate();
-    await pool.query(
-      `INSERT INTO domain_checks (domain, isp, dns, update_time, status_http, status_final)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
-        result.Domain || "",
-        result.ISP || "",
-        result.DNS || "",
-        vnDate,
-        result.StatusHTTP ? String(result.StatusHTTP) : "",
-        result.StatusFinal || "FAIL"
-      ]
-    );
-  } catch (error) {
-    console.error(`[${getVietnamLogTime()}] Error saving to database for domain ${result.Domain}:`, error);
-    // Don't throw - continue processing other rows
-  }
-}
-
-/**
- * Write output to Apps Script:
- * POST {action:"output", token, outputSpreadsheetId, sheetName, headers, data}
- */
-async function postOutput(sheetName, data) {
-  const payload = {
-    action: "output",
-    token: GS_TOKEN,
-    sheetName,
-    headers: [
-      "Domain",
-      "ISP",
-      "DNS",
-      "Update",
-      "StatusHTTP",
-      "StatusFinal"
-    ],
-    data: data.map(row => ({
-      Domain: row.Domain || "",
-      ISP: row.ISP || "",
-      DNS: row.DNS || "",
-      Update: getVietnamISOString(),
-      StatusHTTP: row.StatusHTTP ? String(row.StatusHTTP) : "",
-      StatusFinal: row.StatusFinal || "FAIL"
-    }))
-  };
-
-  // Add output spreadsheet ID if provided
-  if (GS_OUTPUT_SPREADSHEET_ID) {
-    payload.outputSpreadsheetId = GS_OUTPUT_SPREADSHEET_ID;
-  }
-
-  const res = await axios.post(GS_API_URL, payload, { timeout: 30000 });
-  if (!res.data?.ok) throw new Error(res.data?.error || "GS output error");
   return res.data;
 }
 
-/**
- * Name output sheet: HH:mm_MM/DD/YYYY theo Asia/Ho_Chi_Minh
- */
-function vnSheetName(date = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: VIETNAM_TIMEZONE,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit"
-  })
-    .formatToParts(date)
-    .reduce((acc, p) => ((acc[p.type] = p.value), acc), {});
-  return `${parts.hour}:${parts.minute}_${parts.month}/${parts.day}/${parts.year}`;
+// Chuẩn hóa tên giải -> mã giải
+function normalizePrizeCode(label, regionCode) {
+  const l = label.toLowerCase();
+
+  if (l.includes('đặc biệt') || l.includes('dac biet')) return 'DB';
+  if (l.includes('nhất') || l.includes('nhat')) return 'G1';
+  if (l.includes('nhì') || l.includes('nhi')) return 'G2';
+  if (l.includes('ba')) return 'G3';
+  if (l.includes('tư') || l.includes('tu')) return 'G4';
+  if (l.includes('năm') || l.includes('nam')) return 'G5';
+  if (l.includes('sáu') || l.includes('sau')) return 'G6';
+  if (l.includes('bảy') || l.includes('bay')) return 'G7';
+  if (l.includes('tám') || l.includes('tam')) return 'G8';
+
+  // Có thể có các giải phụ khác, bạn bổ sung thêm nếu cần
+  return null;
 }
 
 /**
- * Main per-row process:
- * - Try candidates
- * - SUCCESS only if status 200
- * - Retry Max_Slot_try times
- * - Delay between retries: Maxtime_try + 5s (+ extra delay from fixPlan)
- * - Each retry must apply “fix plan” based on last fail status
+ * Parse HTML Minh Ngọc thành:
+ * [
+ *   {
+ *     provinceName: 'TP Hồ Chí Minh',
+ *     prizes: [
+ *       { prize_code: 'DB', numbers: ['123456'] },
+ *       { prize_code: 'G1', numbers: ['98765'] },
+ *       ...
+ *     ]
+ *   },
+ *   ...
+ * ]
  */
-async function processRow(row) {
-  const domain = String(row.Domain || "").trim();
-  const proxyRaw = row.Proxy_IP_PORT_USER_PASS;
-  const proxyUrl = parseProxy(proxyRaw);
+function parseMinhNgocHtml(html, regionCode) {
+  const $ = cheerio.load(html);
+  const result = [];
 
-  const isp = row.ISP ?? "";
-  const dns = row.DNS ?? "";
+  // Cấu trúc Minh Ngọc có thể thay đổi, ở đây chọn cách parse tương đối generic.
+  $('table').each((_, table) => {
+    const $table = $(table);
 
-  const maxSlots = parseInt(row.Max_Slot_try || DEFAULT_MAX_SLOTS, 10);
-  const maxTimeTrySec = parseInt(row.Maxtime_try || DEFAULT_MAXTIME_TRY_SECONDS, 10);
-  // Nếu Maxtime_try đang là milliseconds, đổi dòng dưới thành: const baseDelayMs = maxTimeTrySec + 5000;
-  const baseDelayMs = maxTimeTrySec * 1000 + 5000;
+    const headerText = $table.find('thead th, thead td').first().text().trim();
+    if (!headerText) return;
 
-  const candidates = buildCandidateUrls(domain);
-  if (!domain || candidates.length === 0) {
-    return {
-      ...row,
-      StatusHTTP: "",
-      StatusFinal: "FAIL",
-      TriedCount: 0,
-      LastURL: ""
-    };
-  }
+    const provinceName = headerText
+      .replace('Kết quả xổ số', '')
+      .replace('Xổ số', '')
+      .trim();
 
-  let tried = 0;
-  let lastStatus = "";
-  let lastUrl = candidates[0];
-  let statusFinal = "FAIL";
+    if (!provinceName) return;
 
-  // vòng retry slots
-  let currentUrl = candidates[0];
-  let currentHeaders = null;
+    const prizeMap = new Map();
 
-  // để “xử lí redirect” nhiều bước nhưng vẫn nằm trong 1 slot:
-  let redirectFixCount = 0;
+    $table.find('tbody tr').each((__, row) => {
+      const $cells = $(row).find('td');
+      if ($cells.length < 2) return;
 
-  for (let slot = 1; slot <= maxSlots; slot++) {
-    tried = slot;
+      const rawPrize = $cells.eq(0).text().trim();
+      const rawNumbers = $cells.eq(1).text().trim();
 
-    try {
-      const result = await checkOnce({
-        url: currentUrl,
-        proxyUrl,
-        headers: currentHeaders
-      });
+      if (!rawPrize || !rawNumbers) return;
 
-      lastStatus = result.status;
-      lastUrl = currentUrl;
+      const prizeCode = normalizePrizeCode(rawPrize, regionCode);
+      const numbers = rawNumbers
+        .split('-')
+        .map(s => s.trim())
+        .filter(Boolean);
 
-      // SUCCESS only when 200
-      if (result.status === 200) {
-        statusFinal = "SUCCESS";
-        break;
+      if (!prizeCode || numbers.length === 0) return;
+
+      if (!prizeMap.has(prizeCode)) {
+        prizeMap.set(prizeCode, []);
+      }
+      prizeMap.get(prizeCode).push(...numbers);
+    });
+
+    if (prizeMap.size === 0) return;
+
+    const prizes = [];
+    for (const [prize_code, numbers] of prizeMap.entries()) {
+      prizes.push({ prize_code, numbers });
+    }
+
+    result.push({ provinceName, prizes });
+  });
+
+  return result;
+}
+
+async function saveCrawledDayRegionToDb(regionCode, dateObj, parsedList) {
+  if (!parsedList || parsedList.length === 0) return;
+
+  const regionRes = await pool.query('SELECT id FROM regions WHERE code = $1', [regionCode]);
+  if (regionRes.rowCount === 0) return;
+  const regionId = regionRes.rows[0].id;
+
+  const clientDb = await pool.connect();
+  try {
+    await clientDb.query('BEGIN');
+
+    for (const item of parsedList) {
+      const mappedCode = MINH_NGOC_PROVINCE_NAME_MAP[item.provinceName];
+      if (!mappedCode) {
+        console.log('Không map được tỉnh:', item.provinceName, 'region', regionCode);
+        continue;
       }
 
-      // FAIL: xử lí theo status
-      const fixPlan = getFixPlan({
-        status: result.status,
-        errorCode: null,
-        currentUrl,
-        domain,
-        redirectLocation: result.redirectLocation
-      });
+      const provRes = await clientDb.query(
+        'SELECT id FROM lottery_provinces WHERE code = $1 AND region_id = $2 LIMIT 1;',
+        [mappedCode, regionId]
+      );
+      if (provRes.rowCount === 0) {
+        console.log('Không tìm thấy tỉnh trong DB:', mappedCode, item.provinceName);
+        continue;
+      }
+      const provinceId = provRes.rows[0].id;
 
-      // special: redirect fix limited
-      if (result.status >= 300 && result.status <= 399 && result.redirectLocation) {
-        redirectFixCount += 1;
-        if (redirectFixCount > MAX_REDIRECT_FIX) {
-          // quá nhiều redirect “fix” -> cứ coi là fail bình thường và đi retry slot tiếp
-          redirectFixCount = 0;
-        } else if (fixPlan.nextUrls?.length) {
-          // thử URL location trong lần slot kế tiếp
-          currentUrl = fixPlan.nextUrls[0];
+      const drawRes = await clientDb.query(
+        `
+        INSERT INTO lottery_draws (draw_date, province_id, region_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (draw_date, province_id) DO UPDATE
+          SET region_id = EXCLUDED.region_id
+        RETURNING id;
+        `,
+        [dateObj.iso, provinceId, regionId]
+      );
+      const drawId = drawRes.rows[0].id;
+
+      await clientDb.query('DELETE FROM lottery_results WHERE draw_id = $1;', [drawId]);
+
+      for (const prize of item.prizes) {
+        let order = 1;
+        for (const num of prize.numbers) {
+          await clientDb.query(
+            `
+            INSERT INTO lottery_results (draw_id, prize_code, prize_order, result_number)
+            VALUES ($1, $2, $3, $4);
+            `,
+            [drawId, prize.prize_code, order, num]
+          );
+          order++;
         }
-      } else {
-        redirectFixCount = 0;
       }
-
-      if (fixPlan.headers) currentHeaders = fixPlan.headers;
-
-      // chọn next url nếu fixPlan đề xuất (vd 404)
-      if (fixPlan.nextUrls?.length) {
-        // ưu tiên URL khác current nếu có
-        const pick = fixPlan.nextUrls.find((u) => u !== currentUrl) || fixPlan.nextUrls[0];
-        currentUrl = pick;
-      }
-
-      // delay trước khi retry slot tiếp theo
-      const waitMs = baseDelayMs + (fixPlan.extraDelayMs || 0);
-      if (slot < maxSlots) await sleep(waitMs);
-    } catch (err) {
-      const msg = String(err?.message || err);
-      const code = err?.code || null;
-
-      lastStatus = ""; // không có HTTP status
-      lastUrl = currentUrl;
-
-      // xử lí theo error
-      const fixPlan = getFixPlan({
-        status: null,
-        errorCode: code,
-        currentUrl,
-        domain,
-        redirectLocation: null
-      });
-
-      if (fixPlan.headers) currentHeaders = fixPlan.headers;
-      if (fixPlan.nextUrls?.length) currentUrl = fixPlan.nextUrls[0];
-
-      const waitMs = baseDelayMs + (fixPlan.extraDelayMs || 0);
-      if (slot < maxSlots) await sleep(waitMs);
-
-      // vẫn tiếp tục retry cho tới slot cuối
-      if (slot === maxSlots) {
-        // final FAIL
-        statusFinal = "FAIL";
-      }
-
-      // ghi log ra console để Railway log
-      console.error(`[${getVietnamLogTime()}] [FAIL] domain=${domain} slot=${slot}/${maxSlots} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"} err=${msg}`);
-    }
-  }
-
-  return {
-    Domain: domain,
-    Proxy_IP_PORT_USER_PASS: proxyRaw ?? "",
-    ISP: isp,
-    DNS: dns,
-    Maxtime_try: row.Maxtime_try ?? "",
-    Max_Slot_try: row.Max_Slot_try ?? "",
-    StatusHTTP: lastStatus,
-    StatusFinal: statusFinal,
-    TriedCount: tried,
-    LastURL: lastUrl
-  };
-}
-
-async function main() {
-  console.log(`[${getVietnamLogTime()}] Starting domain check process...`);
-  
-  try {
-    const rows = await getInputRows();
-    console.log(`[${getVietnamLogTime()}] Retrieved ${rows.length} rows from Google Sheets`);
-
-    const output = [];
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-      console.log(`[${getVietnamLogTime()}] Processing row ${i + 1}/${rows.length}: ${row.Domain || "N/A"}`);
-      
-      const r = await processRow(row);
-      output.push(r);
-      
-      // Save to database
-      await saveToDatabase(r);
     }
 
-    const sheetName = vnSheetName(getVietnamDate());
-    await postOutput(sheetName, output);
-
-    console.log(`[${getVietnamLogTime()}] DONE outputSheet=${sheetName} rows=${output.length}`);
-  } catch (error) {
-    console.error(`[${getVietnamLogTime()}] Error in main process:`, error);
-    throw error;
+    await clientDb.query('COMMIT');
+    console.log(`Đã lưu xong ${regionCode} - ${dateObj.iso}`);
+  } catch (err) {
+    await clientDb.query('ROLLBACK');
+    console.error('Lỗi lưu DB:', err);
+  } finally {
+    clientDb.release();
   }
 }
 
-// Initialize database and start scheduled job
-async function start() {
+// ====== SEED DATA REGIONS + PROVINCES ======
+
+async function seedRegionsAndProvinces() {
+  // Insert regions if empty
+  const resRegions = await pool.query(`SELECT COUNT(*)::int AS count FROM regions;`);
+  if (resRegions.rows[0].count === 0) {
+    await pool.query(`
+      INSERT INTO regions (code, name) VALUES
+      ('MB', 'Miền Bắc'),
+      ('MT', 'Miền Trung'),
+      ('MN', 'Miền Nam');
+    `);
+  }
+
+  const regionMapRes = await pool.query(`SELECT id, code FROM regions;`);
+  const regionMap = {};
+  for (const r of regionMapRes.rows) {
+    regionMap[r.code] = r.id;
+  }
+
+  // Danh sách đài xổ số (tương đối đầy đủ, có thể chỉnh thêm nếu bạn muốn)
+  const provinces = [
+    // Miền Bắc (1 đài/ngày, dùng tên tỉnh làm code)
+    { region: 'MB', code: 'HN', name: 'Hà Nội' },
+    { region: 'MB', code: 'HP', name: 'Hải Phòng' },
+    { region: 'MB', code: 'QN', name: 'Quảng Ninh' },
+    { region: 'MB', code: 'TB', name: 'Thái Bình' },
+    { region: 'MB', code: 'BN', name: 'Bắc Ninh' },
+    { region: 'MB', code: 'ND', name: 'Nam Định' },
+    { region: 'MB', code: 'PT', name: 'Phú Thọ' },
+    { region: 'MB', code: 'TH', name: 'Thanh Hóa' },
+    { region: 'MB', code: 'NA', name: 'Nghệ An' },
+    { region: 'MB', code: 'BDH', name: 'Bắc Giang' },
+    { region: 'MB', code: 'HNA', name: 'Hà Nam' },
+    { region: 'MB', code: 'HDU', name: 'Hưng Yên' },
+
+    // Miền Trung
+    { region: 'MT', code: 'DN', name: 'Đà Nẵng' },
+    { region: 'MT', code: 'QT', name: 'Quảng Trị' },
+    { region: 'MT', code: 'QNA', name: 'Quảng Nam' },
+    { region: 'MT', code: 'BD', name: 'Bình Định' },
+    { region: 'MT', code: 'NT', name: 'Ninh Thuận' },
+    { region: 'MT', code: 'KH', name: 'Khánh Hòa' },
+    { region: 'MT', code: 'GL', name: 'Gia Lai' },
+    { region: 'MT', code: 'DK', name: 'Đắk Lắk' },
+    { region: 'MT', code: 'QTN', name: 'Quảng Ngãi' },
+    { region: 'MT', code: 'DNO', name: 'Đắk Nông' },
+    { region: 'MT', code: 'QB', name: 'Quảng Bình' },
+    { region: 'MT', code: 'TTH', name: 'Thừa Thiên Huế' },
+
+    // Miền Nam
+    { region: 'MN', code: 'HCM', name: 'TP Hồ Chí Minh' },
+    { region: 'MN', code: 'AG', name: 'An Giang' },
+    { region: 'MN', code: 'BL', name: 'Bạc Liêu' },
+    { region: 'MN', code: 'BP', name: 'Bình Phước' },
+    { region: 'MN', code: 'BTH', name: 'Bình Thuận' },
+    { region: 'MN', code: 'BRVT', name: 'Bà Rịa - Vũng Tàu' },
+    { region: 'MN', code: 'BTR', name: 'Bến Tre' },
+    { region: 'MN', code: 'BDI', name: 'Bình Dương' },
+    { region: 'MN', code: 'CM', name: 'Cà Mau' },
+    { region: 'MN', code: 'CT', name: 'Cần Thơ' },
+    { region: 'MN', code: 'DL', name: 'Đà Lạt (Lâm Đồng)' },
+    { region: 'MN', code: 'DNM', name: 'Đồng Nai' },
+    { region: 'MN', code: 'DT', name: 'Đồng Tháp' },
+    { region: 'MN', code: 'HG', name: 'Hậu Giang' },
+    { region: 'MN', code: 'KG', name: 'Kiên Giang' },
+    { region: 'MN', code: 'LA', name: 'Long An' },
+    { region: 'MN', code: 'ST', name: 'Sóc Trăng' },
+    { region: 'MN', code: 'TN', name: 'Tây Ninh' },
+    { region: 'MN', code: 'TG', name: 'Tiền Giang' },
+    { region: 'MN', code: 'TV', name: 'Trà Vinh' },
+    { region: 'MN', code: 'VL', name: 'Vĩnh Long' },
+    { region: 'MN', code: 'BPY', name: 'Phú Yên' } // có thể xem lại phân vùng nếu cần
+  ];
+
+  for (const p of provinces) {
+    const regionId = regionMap[p.region];
+    if (!regionId) continue;
+
+    await pool.query(
+      `
+      INSERT INTO lottery_provinces (region_id, code, name)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (code) DO NOTHING;
+      `,
+      [regionId, p.code, p.name]
+    );
+  }
+}
+
+// ====== AUTH MIDDLEWARE ======
+
+async function authMiddleware(req, res, next) {
+  const apiKey = req.headers['x-api-key'];
+  if (!apiKey) {
+    return res.status(401).json({ error: 'Missing x-api-key' });
+  }
+
   try {
-    await initDatabase();
-    console.log(`[${getVietnamLogTime()}] Database initialized successfully`);
-    
-    // Run immediately on startup (optional - remove if you only want scheduled runs)
-    await main();
-    
-    // Schedule job to run every 3 hours (in server timezone, but logs will show Vietnam time)
-    // Note: Cron runs in server timezone. To run at specific Vietnam times, adjust CRON_SCHEDULE
-    // Example: "0 0,3,6,9,12,15,18,21 * * *" runs at 00:00, 03:00, 06:00, etc. in server timezone
-    // If server is UTC, add 7 hours to get Vietnam time (e.g., "0 7,10,13,16,19,22,1,4 * * *" for Vietnam 00:00, 03:00, etc.)
-    console.log(`[${getVietnamLogTime()}] Scheduling job with cron: ${CRON_SCHEDULE} (server timezone)`);
-    console.log(`[${getVietnamLogTime()}] Current Vietnam time: ${getVietnamLogTime()}`);
-    
-    cron.schedule(CRON_SCHEDULE, async () => {
-      console.log(`[${getVietnamLogTime()}] Scheduled job triggered`);
-      try {
-        await main();
-      } catch (error) {
-        console.error(`[${getVietnamLogTime()}] Scheduled job error:`, error);
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || null;
+    const ua = req.headers['user-agent'] || null;
+
+    const result = await pool.query(
+      `SELECT * FROM auth_accept WHERE api_key = $1 AND is_active = TRUE LIMIT 1;`,
+      [apiKey]
+    );
+    if (result.rowCount === 0) {
+      return res.status(403).json({ error: 'Invalid or inactive API key' });
+    }
+
+    const client = result.rows[0];
+
+    // Update last_used_at, ip, ua (ưu tiên ghi log mới)
+    await pool.query(
+      `
+      UPDATE auth_accept
+      SET last_used_at = NOW(),
+          ip_address = COALESCE($1, ip_address),
+          user_agent = COALESCE($2, user_agent)
+      WHERE id = $3;
+      `,
+      [ip, ua, client.id]
+    );
+
+    req.client = {
+      id: client.id,
+      client_id: client.client_id,
+      scopes: client.scopes
+    };
+
+    next();
+  } catch (err) {
+    console.error('Auth error:', err);
+    res.status(500).json({ error: 'Auth internal error' });
+  }
+}
+
+// ====== ROUTES ======
+
+// Tạo client + api_key (tạm thời không bảo vệ, bạn có thể thêm secret sau)
+app.post('/api/auth/register-client', async (req, res) => {
+  try {
+    const { client_id, scopes } = req.body;
+    if (!client_id) {
+      return res.status(400).json({ error: 'client_id is required' });
+    }
+
+    const apiKey = 'api_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const scopesStr = scopes ? JSON.stringify(scopes) : JSON.stringify(['read', 'write']);
+
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || null;
+    const ua = req.headers['user-agent'] || null;
+
+    const result = await pool.query(
+      `
+      INSERT INTO auth_accept (client_id, api_key, ip_address, user_agent, scopes)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, client_id, api_key, scopes, created_at;
+      `,
+      [client_id, apiKey, ip, ua, scopesStr]
+    );
+
+    res.json({ client: result.rows[0] });
+  } catch (err) {
+    console.error('register-client error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Middleware bảo vệ các route sau
+app.use('/api/lottery', authMiddleware);
+
+// Crawl 100 ngày gần nhất từ Minh Ngọc và lưu vào DB
+// Body: { "days": 100 } (tùy chọn, mặc định 100)
+app.post('/api/lottery/crawl-last-days', async (req, res) => {
+  try {
+    const days = Number(req.body?.days) || 100;
+    const dates = getLastNDaysDates(days);
+    const regionOrder = ['MB', 'MT', 'MN'];
+
+    for (const dateObj of dates) {
+      for (const regionCode of regionOrder) {
+        const slug = REGION_SLUGS[regionCode];
+        try {
+          const html = await fetchMinhNgocHtml(slug, dateObj.display);
+          const parsed = parseMinhNgocHtml(html, regionCode);
+          await saveCrawledDayRegionToDb(regionCode, dateObj, parsed);
+          // nghỉ 500ms để tránh spam
+          await new Promise(r => setTimeout(r, 500));
+        } catch (e) {
+          console.error('Lỗi crawl', regionCode, dateObj.display, e.message);
+        }
       }
+    }
+
+    res.json({ success: true, daysCrawled: days });
+  } catch (err) {
+    console.error('crawl-last-days error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Lưu kết quả xổ số cho 1 kỳ quay
+// Body ví dụ:
+// {
+//   "draw_date": "2026-01-01",
+//   "province_code": "HN",
+//   "results": [
+//     { "prize_code": "DB", "prize_order": 1, "result_number": "12345" },
+//     { "prize_code": "G1", "prize_order": 1, "result_number": "54321" },
+//     { "prize_code": "G2", "prize_order": 1, "result_number": "11111" },
+//     { "prize_code": "G2", "prize_order": 2, "result_number": "22222" }
+//   ]
+// }
+app.post('/api/lottery/save-result', async (req, res) => {
+  const client = req.client;
+  if (!client) {
+    return res.status(401).json({ error: 'Unauthenticated' });
+  }
+
+  const { draw_date, province_code, results } = req.body;
+
+  if (!draw_date || !province_code || !Array.isArray(results) || results.length === 0) {
+    return res.status(400).json({ error: 'draw_date, province_code, results are required' });
+  }
+
+  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || null;
+  console.log(`Client ${client.client_id} saving result for ${province_code} on ${draw_date} from IP ${clientIp}`);
+
+  const clientDb = await pool.connect();
+  try {
+    await clientDb.query('BEGIN');
+
+    const provinceRes = await clientDb.query(
+      `SELECT lp.id, lp.region_id, r.code AS region_code
+       FROM lottery_provinces lp
+       JOIN regions r ON r.id = lp.region_id
+       WHERE lp.code = $1
+       LIMIT 1;`,
+      [province_code]
+    );
+    if (provinceRes.rowCount === 0) {
+      await clientDb.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid province_code' });
+    }
+
+    const province = provinceRes.rows[0];
+
+    const drawRes = await clientDb.query(
+      `
+      INSERT INTO lottery_draws (draw_date, province_id, region_id)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (draw_date, province_id) DO UPDATE
+        SET region_id = EXCLUDED.region_id
+      RETURNING id;
+      `,
+      [draw_date, province.id, province.region_id]
+    );
+    const drawId = drawRes.rows[0].id;
+
+    // Xóa kết quả cũ của kỳ quay (nếu có), để insert lại
+    await clientDb.query(`DELETE FROM lottery_results WHERE draw_id = $1;`, [drawId]);
+
+    for (const r of results) {
+      await clientDb.query(
+        `
+        INSERT INTO lottery_results (draw_id, prize_code, prize_order, result_number)
+        VALUES ($1, $2, $3, $4);
+        `,
+        [drawId, r.prize_code, r.prize_order, r.result_number]
+      );
+    }
+
+    await clientDb.query('COMMIT');
+
+    res.json({ success: true, draw_id: drawId });
+  } catch (err) {
+    await clientDb.query('ROLLBACK');
+    console.error('save-result error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    clientDb.release();
+  }
+});
+
+// Lấy kết quả theo ngày + mã tỉnh
+// /api/lottery/results?date=2026-01-01&province_code=HN
+app.get('/api/lottery/results', async (req, res) => {
+  const { date, province_code } = req.query;
+
+  if (!date || !province_code) {
+    return res.status(400).json({ error: 'date and province_code are required' });
+  }
+
+  try {
+    const drawRes = await pool.query(
+      `
+      SELECT d.id AS draw_id, d.draw_date, lp.code AS province_code, lp.name AS province_name,
+             r.code AS region_code, r.name AS region_name
+      FROM lottery_draws d
+      JOIN lottery_provinces lp ON lp.id = d.province_id
+      JOIN regions r ON r.id = d.region_id
+      WHERE d.draw_date = $1 AND lp.code = $2
+      LIMIT 1;
+      `,
+      [date, province_code]
+    );
+
+    if (drawRes.rowCount === 0) {
+      return res.status(404).json({ error: 'No draw found' });
+    }
+
+    const draw = drawRes.rows[0];
+
+    const resultsRes = await pool.query(
+      `
+      SELECT prize_code, prize_order, result_number
+      FROM lottery_results
+      WHERE draw_id = $1
+      ORDER BY prize_code, prize_order;
+      `,
+      [draw.draw_id]
+    );
+
+    res.json({
+      draw: {
+        draw_id: draw.draw_id,
+        draw_date: draw.draw_date,
+        province_code: draw.province_code,
+        province_name: draw.province_name,
+        region_code: draw.region_code,
+        region_name: draw.region_name
+      },
+      results: resultsRes.rows
     });
-    
-    console.log(`[${getVietnamLogTime()}] Scheduler started. Waiting for next scheduled run...`);
-    
-    // Keep process alive
-    process.on("SIGTERM", async () => {
-      console.log(`[${getVietnamLogTime()}] SIGTERM received, closing database pool...`);
-      await pool.end();
-      process.exit(0);
+  } catch (err) {
+    console.error('get results error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ====== START SERVER ======
+
+const PORT = process.env.PORT || 3000;
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server listening on port ${PORT}`);
     });
-    
-    process.on("SIGINT", async () => {
-      console.log(`[${getVietnamLogTime()}] SIGINT received, closing database pool...`);
-      await pool.end();
-      process.exit(0);
-    });
-  } catch (error) {
-    console.error(`[${getVietnamLogTime()}] Error starting application:`, error);
+  })
+  .catch(err => {
+    console.error('Failed to init DB:', err);
     process.exit(1);
-  }
-}
-
-start();
+  });
